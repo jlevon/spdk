@@ -368,7 +368,7 @@ map_one(vfu_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec 
 	assert(sg != NULL);
 	assert(iov != NULL);
 
-	ret = vfu_addr_to_sg(ctx, addr, len, sg, 1, PROT_READ | PROT_WRITE);
+	ret = vfu_addr_to_sg(ctx, (void *)(uintptr_t)addr, len, sg, 1, PROT_READ | PROT_WRITE);
 	if (ret != 1) {
 		return NULL;
 	}
@@ -1068,12 +1068,17 @@ unmap_admin_queue(struct nvmf_vfio_user_ctrlr *ctrlr)
 }
 
 static void
-memory_region_add_cb(vfu_ctx_t *vfu_ctx, uint64_t iova, uint64_t len, uint32_t prot)
+memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
 	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
 	struct nvmf_vfio_user_ctrlr *ctrlr;
 	struct nvmf_vfio_user_qpair *qpair;
 	int i, ret;
+
+	if (!info->vaddr || ((uintptr_t)info->mapping.iov_base & MASK_2MB) ||
+	    (info->mapping.iov_len & MASK_2MB)) {
+		return;
+	}
 
 	assert(endpoint != NULL);
 	if (endpoint->ctrlr == NULL) {
@@ -1081,8 +1086,9 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, uint64_t iova, uint64_t len, uint32_t p
 	}
 	ctrlr = endpoint->ctrlr;
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: map IOVA %#lx-%#lx\n",
-		      ctrlr_id(ctrlr), iova, iova + len);
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: map IOVA %#lx-%#lx\n", ctrlr_id(ctrlr),
+		      (uintptr_t)info->mapping.iov_base,
+		      (uintptr_t)info->mapping.iov_base + info->mapping.iov_len);
 
 	for (i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
 		qpair = ctrlr->qp[i];
@@ -1123,7 +1129,7 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, uint64_t iova, uint64_t len, uint32_t p
 }
 
 static int
-memory_region_remove_cb(vfu_ctx_t *vfu_ctx, uint64_t iova, uint64_t len)
+memory_region_remove_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
 
 	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
@@ -1131,14 +1137,20 @@ memory_region_remove_cb(vfu_ctx_t *vfu_ctx, uint64_t iova, uint64_t len)
 	struct nvmf_vfio_user_qpair *qpair;
 	int i;
 
+	if (!info->vaddr || ((uintptr_t)info->mapping.iov_base & MASK_2MB) ||
+	    (info->mapping.iov_len & MASK_2MB)) {
+		return 0;
+	}
+
 	assert(endpoint != NULL);
 	if (endpoint->ctrlr == NULL) {
 		return 0;
 	}
 	ctrlr = endpoint->ctrlr;
 
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: unmap IOVA %#lx-%#lx\n",
-		      ctrlr_id(ctrlr), iova, iova + len);
+	SPDK_DEBUGLOG(nvmf_vfio, "%s: unmap IOVA %#lx-%#lx\n", ctrlr_id(ctrlr),
+		      (uintptr_t)info->mapping.iov_base,
+		      (uintptr_t)info->mapping.iov_base + info->mapping.iov_len);
 
 	for (i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
 		qpair = ctrlr->qp[i];
@@ -1146,8 +1158,10 @@ memory_region_remove_cb(vfu_ctx_t *vfu_ctx, uint64_t iova, uint64_t len)
 			continue;
 		}
 
-		if ((qpair->cq.sg.dma_addr >= iova && qpair->cq.sg.dma_addr < iova + len) ||
-		    (qpair->sq.sg.dma_addr >= iova && qpair->sq.sg.dma_addr < iova + len)) {
+		if ((qpair->cq.addr >= info->mapping.iov_base &&
+		     qpair->cq.addr < info->mapping.iov_base + info->mapping.iov_len) ||
+		    (qpair->sq.addr >= info->mapping.iov_base &&
+		     qpair->sq.addr < info->mapping.iov_base + info->mapping.iov_len)) {
 			unmap_qp(qpair);
 			qpair->state = VFIO_USER_QPAIR_INACTIVE;
 		}
@@ -1471,7 +1485,7 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_endpoint *endpoint)
 		return ret;
 	}
 
-	ret = vfu_setup_device_dma_cb(vfu_ctx, memory_region_add_cb, memory_region_remove_cb);
+	ret = vfu_setup_device_dma(vfu_ctx, memory_region_add_cb, memory_region_remove_cb);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup dma callback\n", vfu_ctx);
 		return ret;
