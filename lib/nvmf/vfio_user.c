@@ -368,13 +368,11 @@ map_one(vfu_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec 
 	ret = vfu_addr_to_sg(ctx, (vfu_dma_addr_t)addr, len, sg,
                          1, PROT_READ | PROT_WRITE);
 	if (ret != 1) {
-		errno = ret;
 		return NULL;
 	}
 
 	ret = vfu_map_sg(ctx, sg, iov, 1);
 	if (ret != 0) {
-		errno = ret;
 		return NULL;
 	}
 
