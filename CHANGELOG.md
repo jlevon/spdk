@@ -13,6 +13,9 @@ Added an accelerated table pointer in spdk_nvme_poll_group
 which can be used provide the accelerated functions by users with
 hardware engine, such as crc32c accelerated function.
 
+Renamed the `spdk_nvme_map_prps` to `spdk_nvme_map_cmd` to cover the NVMe
+SGL cases.
+
 ### raid
 
 For `bdev_raid_create` RPC, the deprecated parameter `strip_size` was removed.
