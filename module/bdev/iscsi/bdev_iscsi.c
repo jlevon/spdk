@@ -70,6 +70,9 @@ struct bdev_iscsi_io {
 	enum spdk_scsi_sense sk;
 	uint8_t asc;
 	uint8_t ascq;
+
+	struct unmap_list unmap;
+	uint64_t unmap_max_lba_count;
 };
 
 struct bdev_iscsi_lun {
@@ -84,6 +87,7 @@ struct bdev_iscsi_lun {
 	struct spdk_poller		*no_main_ch_poller;
 	struct spdk_thread		*no_main_ch_poller_td;
 	bool				unmap_supported;
+	uint32_t			unmap_max_lba_count;
 	struct spdk_poller		*poller;
 };
 
@@ -99,6 +103,7 @@ struct bdev_iscsi_conn_req {
 	spdk_bdev_iscsi_create_cb		create_cb;
 	void					*create_cb_arg;
 	bool					unmap_supported;
+	uint32_t				unmap_max_lba_count;
 	int					lun;
 	int					status;
 	TAILQ_ENTRY(bdev_iscsi_conn_req)	link;
@@ -307,17 +312,56 @@ bdev_iscsi_flush(struct bdev_iscsi_lun *lun, struct bdev_iscsi_io *iscsi_io, uin
 	}
 }
 
-static void
-bdev_iscsi_unmap(struct bdev_iscsi_lun *lun, struct bdev_iscsi_io *iscsi_io,
-		 uint64_t lba, uint64_t num_blocks)
-{
-	struct scsi_task *task;
-	struct unmap_list list[1];
+static void bdev_iscsi_unmap(struct iscsi_context *context, struct bdev_iscsi_io *iscsi_io);
 
-	list[0].lba = lba;
-	list[0].num = num_blocks;
-	task = iscsi_unmap_task(lun->context, 0, 0, 0, list, 1,
-				bdev_iscsi_command_cb, iscsi_io);
+static void
+bdev_iscsi_unmap_cb(struct iscsi_context *context, int status, void *_task, void *_iscsi_io)
+{
+	struct bdev_iscsi_io *iscsi_io = _iscsi_io;
+	struct scsi_task *task = _task;
+
+	if (status != SPDK_SCSI_STATUS_GOOD || iscsi_io->unmap.num == 0) {
+		bdev_iscsi_command_cb(context, status, _task, _iscsi_io);
+		return;
+	}
+
+	scsi_free_scsi_task(task);
+
+	// FIXME: arbitrary stack nesting, blech.
+	bdev_iscsi_unmap(context, iscsi_io);
+}
+
+/*
+ * The iSCSI server may limit how large an LBA range can be unmapped (and also,
+ * separately, the sizeof the unmap_list array in the request); we already got
+ * this limit from VPD and stored it in ->unmap_max_lba_count. In this case, we
+ * need to split up the unmap request into smaller requests until we are done.
+ *
+ * Note that the first request should always happen even if "num" is zero.
+ */
+static void
+bdev_iscsi_unmap(struct iscsi_context *context, struct bdev_iscsi_io *iscsi_io)
+{
+	struct unmap_list list;
+	struct scsi_task *task;
+	uint32_t count;
+
+	count = iscsi_io->unmap.num;
+
+	if (iscsi_io->unmap_max_lba_count != UINT32_MAX) {
+		 count = spdk_min(iscsi_io->unmap.num,
+				  iscsi_io->unmap_max_lba_count);
+	}
+
+	list.lba = iscsi_io->unmap.lba;
+	list.num = count;
+
+	iscsi_io->unmap.lba += count;
+	iscsi_io->unmap.num -= count;
+
+	task = iscsi_unmap_task(context, 0, 0, 0, &list, 1,
+				bdev_iscsi_unmap_cb, iscsi_io);
+
 	if (task == NULL) {
 		SPDK_ERRLOG("failed to get unmap_task\n");
 		bdev_iscsi_io_complete(iscsi_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -455,9 +499,10 @@ static void _bdev_iscsi_submit_request(void *_bdev_io)
 		bdev_iscsi_reset(bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_UNMAP:
-		bdev_iscsi_unmap(lun, iscsi_io,
-				 bdev_io->u.bdev.offset_blocks,
-				 bdev_io->u.bdev.num_blocks);
+		iscsi_io->unmap.lba = bdev_io->u.bdev.offset_blocks;
+		iscsi_io->unmap.num = bdev_io->u.bdev.num_blocks;
+		iscsi_io->unmap_max_lba_count = lun->unmap_max_lba_count;
+		bdev_iscsi_unmap(lun->context, iscsi_io);
 		break;
 	default:
 		bdev_iscsi_io_complete(iscsi_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -622,8 +667,8 @@ static const struct spdk_bdev_fn_table iscsi_fn_table = {
 
 static int
 create_iscsi_lun(struct iscsi_context *context, int lun_id, char *url, char *initiator_iqn,
-		 char *name,
-		 uint64_t num_blocks, uint32_t block_size, struct spdk_bdev **bdev, bool unmap_supported)
+		 char *name, uint64_t num_blocks, uint32_t block_size, struct spdk_bdev **bdev,
+		 bool unmap_supported, uint64_t unmap_max_lba_count)
 {
 	struct bdev_iscsi_lun *lun;
 	int rc;
@@ -648,6 +693,7 @@ create_iscsi_lun(struct iscsi_context *context, int lun_id, char *url, char *ini
 	lun->bdev.blockcnt = num_blocks;
 	lun->bdev.ctxt = lun;
 	lun->unmap_supported = unmap_supported;
+	lun->unmap_max_lba_count = unmap_max_lba_count;
 
 	lun->bdev.fn_table = &iscsi_fn_table;
 
@@ -691,7 +737,8 @@ iscsi_readcapacity16_cb(struct iscsi_context *iscsi, int status,
 	}
 
 	status = create_iscsi_lun(req->context, req->lun, req->url, req->initiator_iqn, req->bdev_name,
-				  readcap16->returned_lba + 1, readcap16->block_length, &bdev, req->unmap_supported);
+				  readcap16->returned_lba + 1, readcap16->block_length, &bdev,
+				  req->unmap_supported, req->unmap_max_lba_count);
 	if (status) {
 		SPDK_ERRLOG("Unable to create iscsi bdev: %s (%d)\n", spdk_strerror(-status), status);
 	}
@@ -702,7 +749,35 @@ ret:
 }
 
 static void
-bdev_iscsi_inquiry_cb(struct iscsi_context *context, int status, void *_task, void *private_data)
+bdev_iscsi_limits_inquiry_cb(struct iscsi_context *context, int status, void *_task, void *private_data)
+{
+	struct scsi_task *task = _task;
+	struct scsi_inquiry_block_limits *limits_inq = NULL;
+	struct bdev_iscsi_conn_req *req = private_data;
+
+	if (status == SPDK_SCSI_STATUS_GOOD) {
+		limits_inq = scsi_datain_unmarshall(task);
+		if (limits_inq != NULL) {
+			if (limits_inq->max_unmap == 0) {
+				req->unmap_supported = false;
+				req->unmap_max_lba_count = UINT32_MAX;
+			} else {
+				req->unmap_max_lba_count = limits_inq->max_unmap;
+			}
+		}
+	}
+
+	task = iscsi_readcapacity16_task(context, req->lun, iscsi_readcapacity16_cb, req);
+	if (task) {
+		return;
+	}
+
+	SPDK_ERRLOG("iSCSI error: %s\n", iscsi_get_error(context));
+	complete_conn_req(req, NULL, status);
+}
+
+static void
+bdev_iscsi_lbp_inquiry_cb(struct iscsi_context *iscsi, int status, void *_task, void *private_data)
 {
 	struct scsi_task *task = _task;
 	struct scsi_inquiry_logical_block_provisioning *lbp_inq = NULL;
@@ -712,15 +787,18 @@ bdev_iscsi_inquiry_cb(struct iscsi_context *context, int status, void *_task, vo
 		lbp_inq = scsi_datain_unmarshall(task);
 		if (lbp_inq != NULL && lbp_inq->lbpu) {
 			req->unmap_supported = true;
+			req->unmap_max_lba_count = UINT32_MAX;
 		}
 	}
 
-	task = iscsi_readcapacity16_task(context, req->lun, iscsi_readcapacity16_cb, req);
+	task = iscsi_inquiry_task(iscsi, req->lun, 1,
+				  SCSI_INQUIRY_PAGECODE_BLOCK_LIMITS,
+				  255, bdev_iscsi_limits_inquiry_cb, req);
 	if (task) {
 		return;
 	}
 
-	SPDK_ERRLOG("iSCSI error: %s\n", iscsi_get_error(req->context));
+	SPDK_ERRLOG("iSCSI error: %s\n", iscsi_get_error(iscsi));
 	complete_conn_req(req, NULL, status);
 }
 
@@ -737,7 +815,7 @@ iscsi_connect_cb(struct iscsi_context *iscsi, int status,
 
 	task = iscsi_inquiry_task(iscsi, req->lun, 1,
 				  SCSI_INQUIRY_PAGECODE_LOGICAL_BLOCK_PROVISIONING,
-				  255, bdev_iscsi_inquiry_cb, req);
+				  255, bdev_iscsi_lbp_inquiry_cb, req);
 	if (task) {
 		return;
 	}
