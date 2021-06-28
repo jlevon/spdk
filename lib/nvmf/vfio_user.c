@@ -1056,11 +1056,13 @@ consume_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct nvmf_vfio_user_qpair *qpa
 	return handle_cmd_req(ctrlr, cmd, get_nvmf_req(qpair));
 }
 
-static ssize_t
+/* Returns the number of commands processed, or a negative value on error. */
+static int
 handle_sq_tdbl_write(struct nvmf_vfio_user_ctrlr *ctrlr, const uint32_t new_tail,
 		     struct nvmf_vfio_user_qpair *qpair)
 {
 	struct spdk_nvme_cmd *queue;
+	int count = 0;
 
 	assert(ctrlr != NULL);
 	assert(qpair != NULL);
@@ -1069,6 +1071,8 @@ handle_sq_tdbl_write(struct nvmf_vfio_user_ctrlr *ctrlr, const uint32_t new_tail
 	while (sq_head(qpair) != new_tail) {
 		int err;
 		struct spdk_nvme_cmd *cmd = &queue[sq_head(qpair)];
+
+		count++;
 
 		/*
 		 * SQHD must contain the new head pointer, so we must increase
@@ -1082,7 +1086,7 @@ handle_sq_tdbl_write(struct nvmf_vfio_user_ctrlr *ctrlr, const uint32_t new_tail
 		}
 	}
 
-	return 0;
+	return count;
 }
 
 static int
@@ -2375,38 +2379,44 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	return 0;
 }
 
-static void
+/* Returns the number of commands processed, or a negative value on error. */
+static int
 nvmf_vfio_user_qpair_poll(struct nvmf_vfio_user_qpair *qpair)
 {
 	struct nvmf_vfio_user_ctrlr *ctrlr;
 	uint32_t new_tail;
+	int count = 0;
 
 	assert(qpair != NULL);
 
 	ctrlr = qpair->ctrlr;
 
 	new_tail = *tdbl(ctrlr, &qpair->sq);
-	if (sq_head(qpair) != new_tail) {
-		int err = handle_sq_tdbl_write(ctrlr, new_tail, qpair);
-		if (err != 0) {
-			fail_ctrlr(ctrlr);
-			return;
-		}
+	if (sq_head(qpair) == new_tail) {
+		return 0;
 	}
+
+	count = handle_sq_tdbl_write(ctrlr, new_tail, qpair);
+	if (count < 0) {
+		fail_ctrlr(ctrlr);
+	}
+
+	return count;
 }
 
 /*
- * Called unconditionally, periodically, very frequently from SPDK to ask
- * whether there's work to be done.  This function consumes requests generated
- * from read/write_bar0 by setting ctrlr->prop_req.dir.  read_bar0, and
- * occasionally write_bar0 -- though this may change, synchronously wait. This
- * function also consumes requests by looking at the doorbells.
+ * vfio-user transport poll handler. Note that the library context is polled in
+ * a separate poller (->vfu_ctx_poller), so this poller only needs to poll the
+ * active qpairs.
+ *
+ * Returns the number of commands processed, or a negative value on error.
  */
 static int
 nvmf_vfio_user_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct nvmf_vfio_user_poll_group *vu_group;
 	struct nvmf_vfio_user_qpair *vu_qpair, *tmp;
+	int count = 0;
 
 	assert(group != NULL);
 
@@ -2415,13 +2425,22 @@ nvmf_vfio_user_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	vu_group = SPDK_CONTAINEROF(group, struct nvmf_vfio_user_poll_group, group);
 
 	TAILQ_FOREACH_SAFE(vu_qpair, &vu_group->qps, link, tmp) {
+		int ret;
+
 		if (spdk_unlikely(vu_qpair->state != VFIO_USER_QPAIR_ACTIVE || !vu_qpair->sq.size)) {
 			continue;
 		}
-		nvmf_vfio_user_qpair_poll(vu_qpair);
+
+		ret = nvmf_vfio_user_qpair_poll(vu_qpair);
+
+		if (ret < 0) {
+			return ret;
+		}
+
+		count += ret;
 	}
 
-	return 0;
+	return count;
 }
 
 static int
