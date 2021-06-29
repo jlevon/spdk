@@ -864,7 +864,7 @@ nvmf_ctrlr_association_remove(void *ctx)
 	}
 
 	nvmf_ctrlr_stop_association_timer(ctrlr);
-	return 1;
+	return SPDK_POLLER_BUSY;
 }
 
 static void
